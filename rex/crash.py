@@ -8,7 +8,7 @@ import operator
 import pickle
 
 import archr
-import claripy
+from angr import claripy
 from tracer import TracerPoV
 from angr.state_plugins.trace_additions import ChallRespInfo, ZenPlugin
 from angr.state_plugins.preconstrainer import SimStatePreconstrainer
@@ -67,7 +67,7 @@ class BaseCrash:
             return
 
         # finally, create an angrop object
-        rop = self.project.analyses.ROP(fast_mode=self._rop_fast_mode, rebase=False)
+        rop = self.project.analyses.ROP(fast_mode=self._rop_fast_mode)
         rop.set_badbytes(self._bad_bytes)
         if self._rop_cache and self._rop_cache[0]:
             l.info("Loading rop gadgets from cache")
@@ -107,11 +107,13 @@ class BaseCrash:
         # finally, create an angrop object
         bin_opts = {"base_addr": base_addr}
         project = angr.Project(self.libc_binary, auto_load_libs=False, main_opts=bin_opts)
-        libc_rop = project.analyses.ROP(fast_mode=self._rop_fast_mode, rebase=False)
+        libc_rop = project.analyses.ROP(fast_mode=self._rop_fast_mode)
         libc_rop.set_badbytes(self._bad_bytes)
         if self._rop_cache and self._rop_cache[1]:
             l.info("Loading libc rop gadgets from cache")
             libc_rop._load_cache_tuple(self._rop_cache[1])
+            for g in libc_rop._all_gadgets:
+                g.project = self.project
         else:
             l.info("Collecting ROP gadgets in libc... don't panic if you see tons of error messages!")
             l.info("It may take several minutes to finish...")
@@ -128,6 +130,13 @@ class BaseCrash:
             return
         with open(self._rop_cache_path, "rb") as f:
             self._rop_cache = pickle.load(f)
+        gadgets = []
+        if self._rop_cache[0]:
+            gadgets += self._rop_cache[0][0]
+        if self._rop_cache[1]:
+            gadgets += self._rop_cache[1][0]
+        for g in gadgets:
+            g.project = self.project
 
     def soft_save_cache(self):
         if not self._rop_cache_path:
@@ -138,8 +147,20 @@ class BaseCrash:
         rop_cache_tuple = self.rop._get_cache_tuple() if self.rop else None
         libc_rop_cache_tuple = self.libc_rop._get_cache_tuple() if self.libc_rop else None
         rop_cache = (rop_cache_tuple, libc_rop_cache_tuple)
+
+        gadgets = []
+        if rop_cache[0]:
+            gadgets += rop_cache[0][0]
+        if rop_cache[1]:
+            gadgets += rop_cache[1][0]
+
+        for g in gadgets:
+            g.project = None
+        os.makedirs(os.path.dirname(self._rop_cache_path) or ".", exist_ok=True)
         with open(self._rop_cache_path, "wb") as f:
             pickle.dump(rop_cache, f)
+        for g in gadgets:
+            g.project = self.project
 
     @staticmethod
     def _get_cache_path(binary):
@@ -179,7 +200,8 @@ class SimCrash(BaseCrash):
         assert self.project is not None
 
         if self.is_cgc:
-            self.project.simos.syscall_library.update(angr.SIM_LIBRARIES['cgcabi_tracer'])
+            simlib = angr.SIM_LIBRARIES['cgcabi_tracer']
+            self.project.simos.syscall_library.update(simlib[0] if isinstance(simlib, list) else simlib)
 
         # Load cached/intermediate states
         if self._crash_state is not None and self._prev_state is not None:
@@ -290,7 +312,7 @@ class CommCrash(SimCrash):
     def __init__(self, target, crash=None, pov_file=None, actions=None,
                  trace_mode=TraceMode.FULL_SYMBOLIC, tracer_opts=None,
                  input_type=CrashInputType.STDIN, port=None,
-                 delay=0, pre_fire_hook=None,
+                 delay=0, pre_fire_hook=None, shell=False,
                  format_infos=None, **kwargs):
         """
         :param target:              archr Target that contains the binary that crashed.
@@ -306,6 +328,7 @@ class CommCrash(SimCrash):
                                     several seconds before trying to set up connection
         :param pre_fire_hook:       function hook that is executed after the target is launched before the input is sent
                                     to the target
+        :param shell:               Used to tell subprocess to run with shell=True or shell=False
         :param actions:             the actions to interact with the target, if specified, crash or pov_file will be ignored
                                     during interaction with the target
         :param format_infos:        A list of atoi FormatInfo objects that should
@@ -318,11 +341,6 @@ class CommCrash(SimCrash):
         if trace_mode != TraceMode.DUMB and actions:
             raise NotImplementedError("actions only support dumb tracer at the moment")
 
-        # input related, ensure crash_input is a list of input
-        # ensure actions are defined
-        self.pov_file = pov_file
-        self.crash_input, self.actions, self.sim_input = self._input_preparation(crash, actions, input_type)
-
         # communication related
         self.target = target # type: archr.targets.Target
         self.input_type = input_type
@@ -330,13 +348,21 @@ class CommCrash(SimCrash):
         self.delay = delay
         self.pre_fire_hook = pre_fire_hook
 
+        # input related, ensure crash_input is a list of input
+        # ensure actions are defined
+        self.pov_file = pov_file
+        self.crash_input, self.actions, self.sim_input = self._input_preparation(crash, actions, input_type)
+
         self.binary = self.target.resolve_local_path(self.target.target_path)
         self._test_case = None
         self._channel = None
 
         # tracing related
         if tracer_opts is None: tracer_opts = {}
-        tracer_opts['tracer_bow'] = tracer_opts.pop("tracer_bow", None) or archr.arsenal.QEMUTracerBow(self.target)
+        tracer_opts['tracer_bow'] = tracer_opts.pop("tracer_bow", None)
+        if not tracer_opts['tracer_bow']: # use QEMUTracer by default
+            qemu_args = tracer_opts.pop('qemu_args', None)
+            tracer_opts['tracer_bow'] = archr.arsenal.QEMUTracerBow(self.target, qemu_args=qemu_args, shell=shell)
         self._tracer_opts = tracer_opts
 
         is_cgc = self.target.target_os == 'cgc'
@@ -361,8 +387,6 @@ class CommCrash(SimCrash):
         assert not self.pov_file, "POV file is not supported anymore!"
         assert actions or crash_input
 
-        channel = self.input_type_to_channel(input_type)
-
         if actions:
             crash_input = b''
             sim_input = []
@@ -372,6 +396,7 @@ class CommCrash(SimCrash):
                     sim_input.append(act.sim_data)
             sim_input = claripy.Concat(*sim_input)
         else:
+            channel = self.input_type_to_channel(input_type)
             open_act = RexOpenChannelAction(channel_name=channel)
             send_act = RexSendAction(crash_input, channel_name=channel)
             actions = [open_act, send_act]
@@ -546,11 +571,14 @@ class CommCrash(SimCrash):
         self._test_case = test_case
         return channel, test_case
 
-    @staticmethod
-    def input_type_to_channel(input_type):
+    def input_type_to_channel(self, input_type):
         channel = Crash._input_type_to_channel_type(input_type)
-        if channel != "stdio":
-            channel += ":0"
+        if channel.startswith("tcp"):
+            idx = self.target.tcp_ports.index(self.target_port)
+            channel += f":{idx}"
+        elif channel.startswith("udp"):
+            idx = self.target.udp_ports.index(self.target_port)
+            channel += f":{idx}"
         return channel
 
     @staticmethod
@@ -946,6 +974,7 @@ class Crash(CommCrash):
     def copy(self):
         cp = Crash.__new__(Crash)
         cp.target = self.target
+        cp.target_port = self.target_port
         cp.binary = self.binary
         cp.libc_binary = self.libc_binary
         cp.tracer = self.tracer
@@ -1010,8 +1039,8 @@ class Crash(CommCrash):
         self._triage_crash()
 
         l.info("Identifying bad_bytes")
-        self._bad_bytes = self.tracer.identify_bad_bytes(self)
-        l.debug("idenfity bad bytes: %s", [hex(x) for x in self._bad_bytes])
+        self._bad_bytes = self.tracer.identify_bad_bytes()
+        l.debug("identify bad bytes: [%s]", ', '.join([hex(x) for x in self._bad_bytes]))
 
     def _explore_arbitrary_read(self, path_file=None):
         # crash type was an arbitrary-read, let's point the violating address at a
@@ -1227,16 +1256,22 @@ class Crash(CommCrash):
 
         l.info("reconstraining flag")
 
-        replace_dict = dict()
+        # Map each symbolic leaf to its concrete replacement. claripy's
+        # replace_dict (keyed by AST hash) is not available in clarirs, so we
+        # apply claripy.replace for each pair; the replacements are symbolic
+        # leaves mapped to concrete values, so sequential replacement is safe.
+        replace_pairs = []
         for c in state.preconstrainer.preconstraints:
             if any(v.startswith('cgc-flag') or v.startswith("random") for v in list(c.variables)):
                 concrete = next(a for a in c.args if not a.symbolic)
                 symbolic = next(a for a in c.args if a.symbolic)
-                replace_dict[symbolic.cache_key] = concrete
+                replace_pairs.append((symbolic, concrete))
         cons = state.solver.constraints
         new_cons = []
         for c in cons:
-            new_c = c.replace_dict(replace_dict)
+            new_c = c
+            for old, new_val in replace_pairs:
+                new_c = claripy.replace(new_c, old, new_val)
             new_cons.append(new_c)
         state.release_plugin("solver")
         state.add_constraints(*new_cons)

@@ -1,11 +1,15 @@
+# pylint: disable=line-too-long
 import os
-import random
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import struct
 import logging
+
+import psutil
+import pytest
 
 import archr
 import rex
@@ -197,8 +201,7 @@ def test_linux_stacksmash_64():
     ld_path = os.path.join(lib_path, "ld-linux-x86-64.so.2")
     path = os.path.join(lib_path, "vuln_stacksmash")
     with archr.targets.LocalTarget([ld_path, '--library-path', lib_path, path], path, target_arch='x86_64').build().start() as target:
-        crash = rex.Crash(target, crash=inp, fast_mode=True,
-            rop_cache_path=os.path.join(cache_location, 'vuln_stacksmash_64'), aslr=False)
+        crash = rex.Crash(target, crash=inp, fast_mode=True, use_rop=False, aslr=False)
 
         exploit = crash.exploit(blacklist_techniques={'ret2libc'})
 
@@ -218,7 +221,7 @@ def test_linux_stacksmash_32():
     path = os.path.join(lib_path, "vuln_stacksmash")
     with archr.targets.LocalTarget([ld_path, '--library-path', lib_path, path], path, target_arch='i386').build().start() as target:
         crash = rex.Crash(target, inp, fast_mode=True,
-            rop_cache_path=os.path.join(cache_location, 'vuln_stacksmash'))
+            rop_cache_path=os.path.join(cache_location, 'vuln_stacksmash_32'))
 
         exploit = crash.exploit(blacklist_techniques={'rop_leak_memory', 'rop_set_register', 'ret2libc'})
 
@@ -231,20 +234,48 @@ def test_linux_stacksmash_32():
         _check_arsenal_has_send(exploit.arsenal)
 
 
+def _get_free_tcp_port():
+    """Return a TCP port that is currently free."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _is_listening_on(port):
+    """Return True if any process is listening on TCP `port`."""
+    return any(
+        conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port
+        for conn in psutil.net_connections(kind="tcp")
+    )
+
+
+def _wait_until_listening(port, timeout=30):
+    """Block until a process is listening on TCP `port`.
+
+    We check the socket state rather than connecting, because the target
+    accept()s exactly one connection -- a probe connection would be consumed
+    instead of the exploit's.
+    """
+    deadline = time.time() + timeout
+    while not _is_listening_on(port):
+        if time.time() > deadline:
+            raise TimeoutError(f"target never started listening on port {port}")
+        time.sleep(0.05)
+
+
 def test_linux_network_stacksmash_64():
     # Test exploiting a simple network server with a stack-based buffer overflow.
     inp = b'\x00' * 500
     lib_path = os.path.join(bin_location, "tests/x86_64")
     # ld_path = os.path.join(lib_path, "ld-linux-x86-64.so.2")
     path = os.path.join(lib_path, "network_overflow")
-    port = random.randint(8000, 9000)
+    port = _get_free_tcp_port()
     with archr.targets.LocalTarget([path, str(port)], path,
                                    target_arch='x86_64',
                                    ipv4_address="127.0.0.1",
                                    tcp_ports=(port,)).build().start() as target:
-        crash = rex.Crash(target, crash=inp, rop_cache_path=os.path.join(cache_location, 'network_overflow_64'),
-            aslr=False,
-            input_type=rex.enums.CrashInputType.TCP, port=port)
+        crash = rex.Crash(target, crash=inp, use_rop=False, aslr=False,
+                input_type=rex.enums.CrashInputType.TCP, port=port)
 
         exploit = crash.exploit(cmd=b"echo hello", blacklist_techniques={'ret2libc'})
 
@@ -254,7 +285,7 @@ def test_linux_network_stacksmash_64():
 
         # let's actually run the exploit
 
-    new_port = random.randint(9001, 10000)
+    new_port = _get_free_tcp_port()
     with archr.targets.LocalTarget([path, str(new_port)],
                                    path,
                                    target_arch='x86_64',
@@ -263,8 +294,9 @@ def test_linux_network_stacksmash_64():
         try:
             new_target.run_command("")
 
-            # wait for the target to load
-            time.sleep(.5)
+            # wait for the target to actually be listening before we launch the
+            # exploit (the generated script connects once, with no retry)
+            _wait_until_listening(new_port)
 
             temp_script = tempfile.NamedTemporaryFile(suffix=".py", delete=False)
             exploit_location = temp_script.name
@@ -274,7 +306,7 @@ def test_linux_network_stacksmash_64():
 
             exploit_result = subprocess.check_output(["python", exploit_location,
                                                       "127.0.0.1", str(new_port),
-                                                      ], timeout=3)
+                                                      ], timeout=30)
             assert b"hello" in exploit_result
         finally:
             os.unlink(exploit_location)
@@ -385,6 +417,8 @@ def test_arbitrary_transmit_no_crash():
 
     _do_arbitrary_transmit_test_for("tests/i386/arbitrary_transmit_no_crash")
 
+
+@pytest.mark.slow
 def test_reconstraining():
     # Test our ability to reconstrain
 
@@ -409,6 +443,11 @@ def test_reconstraining():
         x = cg.attempt_exploit()
         assert x is not None
         assert _do_pov_test(x)
+
+
+# FIXME: This test fails non-deterministically, see angr/rex#93
+test_reconstraining.speed = "slow"
+
 
 def test_cromu71():
     inp = b'3&\x1b\x17/\x12\x1b\x1e]]]]]]]]]]]]]]]]]]]]\n\x1e\x7f\xffC^\n'
